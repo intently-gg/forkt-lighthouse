@@ -1,0 +1,23 @@
+[package]
+name = "forkt-lighthouse"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+async-channel = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+eth2_network_config = { git = "https://github.com/sigp/lighthouse.git", tag = "v8.2.0" }
+futures = "0.3"
+lighthouse_network = { git = "https://github.com/sigp/lighthouse.git", tag = "v8.2.0" }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+task_executor = { git = "https://github.com/sigp/lighthouse.git", tag = "v8.2.0" }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+types = { git = "https://github.com/sigp/lighthouse.git", tag = "v8.2.0" }
+url = "2"
