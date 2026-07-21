@@ -74,7 +74,12 @@ async fn run(config: Config, runtime: Weak<Runtime>) -> Result<()> {
     network_config.client_version =
         concat!("forkt-lighthouse/", env!("CARGO_PKG_VERSION")).to_owned();
     network_config.upnp_enabled = false;
-    network_config.topics = vec![lighthouse_network::types::GossipKind::BeaconBlock];
+    // Blocks reveal forks one slot late; aggregate attestations expose
+    // head-vote splits ~4-8s into the slot, before a competing block exists.
+    network_config.topics = vec![
+        lighthouse_network::types::GossipKind::BeaconBlock,
+        lighthouse_network::types::GossipKind::BeaconAggregateAndProof,
+    ];
     network_config.boot_nodes_enr = network_definition.boot_enr.unwrap_or_default();
     for enr in config.extra_boot_enrs {
         network_config
@@ -153,18 +158,30 @@ async fn handle_network_event(
             let gossip_message_id = id.to_string();
             let gossip_topic = topic.to_string();
             network.report_message_validation_result(&source, id, MessageAcceptance::Ignore);
-            if let lighthouse_network::PubsubMessage::BeaconBlock(block) = message {
-                let client = globals.client(&source).to_string();
-                ingress
-                    .publish_block(
+            match message {
+                lighthouse_network::PubsubMessage::BeaconBlock(block) => {
+                    let client = globals.client(&source).to_string();
+                    ingress.publish_block(
                         observed_at,
                         gossip_message_id,
                         gossip_topic,
                         source,
                         Some(client),
                         &block,
-                    )
-                    .await;
+                    );
+                }
+                lighthouse_network::PubsubMessage::AggregateAndProofAttestation(aggregate) => {
+                    let client = globals.client(&source).to_string();
+                    ingress.publish_aggregate(
+                        observed_at,
+                        gossip_message_id,
+                        gossip_topic,
+                        source,
+                        Some(client),
+                        &aggregate,
+                    );
+                }
+                _ => {}
             }
         }
         NetworkEvent::StatusPeer(peer_id) => {

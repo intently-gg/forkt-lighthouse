@@ -1,4 +1,9 @@
-use std::{path::PathBuf, time::Instant};
+use std::{
+    io::ErrorKind,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -6,9 +11,11 @@ use lighthouse_network::PeerId;
 use serde::Serialize;
 use tokio::net::UnixDatagram;
 use tracing::error;
-use types::{ExecPayload, MainnetEthSpec, SignedBeaconBlock};
+use types::{ExecPayload, MainnetEthSpec, SignedAggregateAndProof, SignedBeaconBlock};
 
-pub const INGRESS_SCHEMA_VERSION: u16 = 1;
+pub const INGRESS_SCHEMA_VERSION: u16 = 2;
+
+static DROPPED_EVIDENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub struct IngressPublisher {
@@ -33,7 +40,7 @@ impl IngressPublisher {
         }
     }
 
-    pub async fn publish_block(
+    pub fn publish_block(
         &self,
         observed_at: IngressTimestamp,
         gossip_message_id: String,
@@ -53,6 +60,7 @@ impl IngressPublisher {
                 timestamp: payload.timestamp(),
             });
         let event = ConsensusIngress {
+            kind: "beacon_block",
             schema_version: INGRESS_SCHEMA_VERSION,
             wall_clock: observed_at.wall_clock,
             monotonic_ns: observed_at.monotonic_ns,
@@ -67,22 +75,68 @@ impl IngressPublisher {
             proposer_index: block.message().proposer_index(),
             execution,
         };
+        self.send(&event);
+    }
 
-        let payload = match serde_json::to_vec(&event) {
+    pub fn publish_aggregate(
+        &self,
+        observed_at: IngressTimestamp,
+        gossip_message_id: String,
+        gossip_topic: String,
+        source: PeerId,
+        client_version: Option<String>,
+        aggregate: &SignedAggregateAndProof<MainnetEthSpec>,
+    ) {
+        let message = aggregate.message();
+        let attestation = message.aggregate();
+        let data = attestation.data();
+        let event = ConsensusIngressAggregate {
+            kind: "aggregate_attestation",
+            schema_version: INGRESS_SCHEMA_VERSION,
+            wall_clock: observed_at.wall_clock,
+            monotonic_ns: observed_at.monotonic_ns,
+            source_peer_id: source.to_string(),
+            source_client: client_version,
+            gossip_message_id,
+            gossip_topic,
+            slot: data.slot.as_u64(),
+            beacon_block_root: data.beacon_block_root.to_string(),
+            target_epoch: data.target.epoch.as_u64(),
+            target_root: data.target.root.to_string(),
+            committee_index: attestation.committee_index(),
+            aggregator_index: message.aggregator_index(),
+            attester_count: attestation.num_set_aggregation_bits() as u64,
+        };
+        self.send(&event);
+    }
+
+    fn send<T: Serialize>(&self, event: &T) {
+        let payload = match serde_json::to_vec(event) {
             Ok(payload) => payload,
             Err(error) => {
                 error!(%error, "failed to serialize consensus ingress event");
                 return;
             }
         };
-        if let Err(error) = self.socket.send_to(&payload, &self.destination).await {
-            // Gossip handling must never block on downstream persistence. A
-            // local socket failure is explicit evidence loss and must page.
-            error!(
-                %error,
-                socket = %self.destination.display(),
-                "failed to deliver consensus ingress event"
-            );
+        match self.socket.try_send_to(&payload, &self.destination) {
+            Ok(_sent) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                let dropped = DROPPED_EVIDENCE.fetch_add(1, Ordering::Relaxed) + 1;
+                if dropped == 1 || dropped.is_multiple_of(100) {
+                    error!(
+                        dropped,
+                        socket = %self.destination.display(),
+                        "dropped consensus ingress event because sensor socket queue is full"
+                    );
+                }
+            }
+            Err(error) => {
+                error!(
+                    %error,
+                    socket = %self.destination.display(),
+                    "failed to deliver consensus ingress event"
+                );
+            }
         }
     }
 }
@@ -95,6 +149,7 @@ pub struct IngressTimestamp {
 
 #[derive(Debug, Serialize)]
 struct ConsensusIngress {
+    kind: &'static str,
     schema_version: u16,
     wall_clock: chrono::DateTime<Utc>,
     monotonic_ns: u64,
@@ -108,6 +163,25 @@ struct ConsensusIngress {
     slot: u64,
     proposer_index: u64,
     execution: Option<ExecutionPayload>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConsensusIngressAggregate {
+    kind: &'static str,
+    schema_version: u16,
+    wall_clock: chrono::DateTime<Utc>,
+    monotonic_ns: u64,
+    source_peer_id: String,
+    source_client: Option<String>,
+    gossip_message_id: String,
+    gossip_topic: String,
+    slot: u64,
+    beacon_block_root: String,
+    target_epoch: u64,
+    target_root: String,
+    committee_index: Option<u64>,
+    aggregator_index: u64,
+    attester_count: u64,
 }
 
 #[derive(Debug, Serialize)]
