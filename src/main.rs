@@ -27,7 +27,9 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-use types::{ChainSpec, ForkContext, MainnetEthSpec, Slot};
+use types::{
+    ChainSpec, ForkContext, MainnetEthSpec, Slot, all_data_column_sidecar_subnets_from_spec,
+};
 
 fn main() -> Result<()> {
     let config = Config::load()?;
@@ -76,10 +78,17 @@ async fn run(config: Config, runtime: Weak<Runtime>) -> Result<()> {
     network_config.upnp_enabled = false;
     // Blocks reveal forks one slot late; aggregate attestations expose
     // head-vote splits ~4-8s into the slot, before a competing block exists.
-    network_config.topics = vec![
+    // Data-column sidecars (post-Fulu blob DAS gossip) give first blob-data
+    // arrival for late-block timing.
+    let mut topics = vec![
         lighthouse_network::types::GossipKind::BeaconBlock,
         lighthouse_network::types::GossipKind::BeaconAggregateAndProof,
     ];
+    topics.extend(
+        all_data_column_sidecar_subnets_from_spec(&spec)
+            .map(lighthouse_network::types::GossipKind::DataColumnSidecar),
+    );
+    network_config.topics = topics;
     network_config.boot_nodes_enr = network_definition.boot_enr.unwrap_or_default();
     for enr in config.extra_boot_enrs {
         network_config
@@ -179,6 +188,19 @@ async fn handle_network_event(
                         source,
                         Some(client),
                         &aggregate,
+                    );
+                }
+                lighthouse_network::PubsubMessage::DataColumnSidecar(boxed) => {
+                    let (subnet_id, sidecar) = boxed.as_ref();
+                    let client = globals.client(&source).to_string();
+                    ingress.publish_blob_sidecar(
+                        observed_at,
+                        gossip_message_id,
+                        gossip_topic,
+                        source,
+                        Some(client),
+                        *subnet_id,
+                        sidecar,
                     );
                 }
                 _ => {}

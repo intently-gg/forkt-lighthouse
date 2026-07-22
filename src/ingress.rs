@@ -11,7 +11,10 @@ use lighthouse_network::PeerId;
 use serde::Serialize;
 use tokio::net::UnixDatagram;
 use tracing::error;
-use types::{ExecPayload, MainnetEthSpec, SignedAggregateAndProof, SignedBeaconBlock};
+use types::{
+    DataColumnSidecar, DataColumnSubnetId, ExecPayload, MainnetEthSpec, SignedAggregateAndProof,
+    SignedBeaconBlock,
+};
 
 pub const INGRESS_SCHEMA_VERSION: u16 = 2;
 
@@ -74,6 +77,49 @@ impl IngressPublisher {
             slot: block.slot().as_u64(),
             proposer_index: block.message().proposer_index(),
             execution,
+            blob_kzg_commitments_count: block
+                .message()
+                .blob_kzg_commitments_len()
+                .map(|len| len as u64),
+        };
+        self.send(&event);
+    }
+
+    /// Emit a blob/DAS sidecar arrival. Post-Fulu Mainnet gossip carries
+    /// `data_column_sidecar_*`; we surface it as `blob_sidecar` so Forkt can
+    /// track when blob data for a block first arrived.
+    pub fn publish_blob_sidecar(
+        &self,
+        observed_at: IngressTimestamp,
+        gossip_message_id: String,
+        gossip_topic: String,
+        source: PeerId,
+        client_version: Option<String>,
+        subnet_id: DataColumnSubnetId,
+        sidecar: &DataColumnSidecar<MainnetEthSpec>,
+    ) {
+        let (beacon_parent_root, proposer_index) = match sidecar {
+            DataColumnSidecar::Fulu(column) => (
+                Some(column.block_parent_root().to_string()),
+                Some(column.block_proposer_index()),
+            ),
+            DataColumnSidecar::Gloas(_) => (None, None),
+        };
+        let event = ConsensusIngressBlobSidecar {
+            kind: "blob_sidecar",
+            schema_version: INGRESS_SCHEMA_VERSION,
+            wall_clock: observed_at.wall_clock,
+            monotonic_ns: observed_at.monotonic_ns,
+            source_peer_id: source.to_string(),
+            source_client: client_version,
+            gossip_message_id,
+            gossip_topic,
+            beacon_block_root: sidecar.block_root().to_string(),
+            beacon_parent_root,
+            slot: sidecar.slot().as_u64(),
+            index: *sidecar.index(),
+            proposer_index,
+            subnet_id: Some(u64::from(subnet_id)),
         };
         self.send(&event);
     }
@@ -168,6 +214,25 @@ struct ConsensusIngress {
     slot: u64,
     proposer_index: u64,
     execution: Option<ExecutionPayload>,
+    blob_kzg_commitments_count: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConsensusIngressBlobSidecar {
+    kind: &'static str,
+    schema_version: u16,
+    wall_clock: chrono::DateTime<Utc>,
+    monotonic_ns: u64,
+    source_peer_id: String,
+    source_client: Option<String>,
+    gossip_message_id: String,
+    gossip_topic: String,
+    beacon_block_root: String,
+    beacon_parent_root: Option<String>,
+    slot: u64,
+    index: u64,
+    proposer_index: Option<u64>,
+    subnet_id: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
