@@ -106,6 +106,11 @@ impl IngressPublisher {
             committee_index: attestation.committee_index(),
             aggregator_index: message.aggregator_index(),
             attester_count: attestation.num_set_aggregation_bits() as u64,
+            attester_bit_positions: attestation
+                .set_aggregation_bits()
+                .into_iter()
+                .map(|position| position as u64)
+                .collect(),
         };
         self.send(&event);
     }
@@ -182,6 +187,7 @@ struct ConsensusIngressAggregate {
     committee_index: Option<u64>,
     aggregator_index: u64,
     attester_count: u64,
+    attester_bit_positions: Vec<u64>,
 }
 
 #[derive(Debug, Serialize)]
