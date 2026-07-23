@@ -14,6 +14,14 @@ pub struct BeaconBootstrap {
     genesis_validators_root: Hash256,
 }
 
+/// Cached Beacon API fields that change slowly relative to slot time.
+#[derive(Clone, Debug)]
+pub struct StatusCheckpoints {
+    pub finalized_epoch: Epoch,
+    pub finalized_root: Hash256,
+    pub head_root: Hash256,
+}
+
 impl BeaconBootstrap {
     pub async fn connect(base_url: Url, expected_genesis_root: Hash256) -> Result<Self> {
         let client = Client::builder()
@@ -33,26 +41,40 @@ impl BeaconBootstrap {
         Ok(bootstrap)
     }
 
-    pub async fn status(&self, spec: &ChainSpec) -> Result<StatusMessage> {
-        let (head, finality): (ApiResponse<HeaderData>, ApiResponse<FinalityData>) = tokio::try_join!(
-            self.get("eth/v1/beacon/headers/head"),
-            self.get("eth/v1/beacon/states/head/finality_checkpoints"),
-        )?;
-        let head_slot = Slot::new(parse_u64(&head.data.header.message.slot)?);
-        let finalized_epoch = Epoch::new(parse_u64(&finality.data.finalized.epoch)?);
+    /// Fetch finalized checkpoint + current head root from the Beacon API.
+    /// Call infrequently; pair with a wall-clock `head_slot` via [`build_status`].
+    pub async fn fetch_checkpoints(&self) -> Result<StatusCheckpoints> {
+        let (head, finality): (ApiResponse<HeaderData>, ApiResponse<FinalityData>) =
+            tokio::try_join!(
+                self.get("eth/v1/beacon/headers/head"),
+                self.get("eth/v1/beacon/states/head/finality_checkpoints"),
+            )?;
+        Ok(StatusCheckpoints {
+            finalized_epoch: Epoch::new(parse_u64(&finality.data.finalized.epoch)?),
+            finalized_root: parse_hash(&finality.data.finalized.root)?,
+            head_root: parse_hash(&head.data.root)?,
+        })
+    }
+
+    pub fn build_status(
+        &self,
+        spec: &ChainSpec,
+        head_slot: Slot,
+        checkpoints: &StatusCheckpoints,
+    ) -> StatusMessage {
         let fork_digest = spec.compute_fork_digest(
             self.genesis_validators_root,
             head_slot.epoch(MainnetEthSpec::slots_per_epoch()),
         );
-
-        Ok(StatusMessage::V2(StatusMessageV2 {
+        StatusMessage::V2(StatusMessageV2 {
             fork_digest,
-            finalized_root: parse_hash(&finality.data.finalized.root)?,
-            finalized_epoch,
-            head_root: parse_hash(&head.data.root)?,
+            finalized_root: checkpoints.finalized_root,
+            finalized_epoch: checkpoints.finalized_epoch,
+            head_root: checkpoints.head_root,
             head_slot,
+            // Network-only sentry: advertise no historical blocks available.
             earliest_available_slot: Slot::new(head_slot.as_u64().saturating_add(1)),
-        }))
+        })
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -81,17 +103,6 @@ struct GenesisData {
 #[derive(Debug, Deserialize)]
 struct HeaderData {
     root: String,
-    header: SignedHeader,
-}
-
-#[derive(Debug, Deserialize)]
-struct SignedHeader {
-    message: HeaderMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct HeaderMessage {
-    slot: String,
 }
 
 #[derive(Debug, Deserialize)]

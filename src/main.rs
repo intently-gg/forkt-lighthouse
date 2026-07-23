@@ -23,7 +23,7 @@ use lighthouse_network::{
 use tokio::{
     runtime::Runtime,
     sync::watch,
-    time::{Duration, MissedTickBehavior},
+    time::{Duration, Instant, MissedTickBehavior},
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -59,9 +59,16 @@ async fn run(config: Config, runtime: Weak<Runtime>) -> Result<()> {
     let current_slot = current_slot(genesis_time, &spec)?;
 
     let bootstrap = BeaconBootstrap::connect(config.beacon_api_url.clone(), genesis_root).await?;
-    let initial_status = bootstrap.status(&spec).await?;
+    let checkpoints = bootstrap.fetch_checkpoints().await?;
+    let initial_status = bootstrap.build_status(&spec, current_slot, &checkpoints);
     let (status_tx, status_rx) = watch::channel(initial_status);
-    tokio::spawn(refresh_status(bootstrap, Arc::clone(&spec), status_tx));
+    tokio::spawn(refresh_status(
+        bootstrap,
+        Arc::clone(&spec),
+        genesis_time,
+        checkpoints,
+        status_tx,
+    ));
 
     let mut network_config = NetworkConfig::default();
     network_config.network_dir = config.data_dir.clone();
@@ -288,21 +295,44 @@ fn send_status(network: &mut Network<MainnetEthSpec>, peer_id: PeerId, status: S
     }
 }
 
+/// Locally advance `head_slot` from wall clock this often (no Beacon API).
+const STATUS_TICK: Duration = Duration::from_secs(12);
+/// Re-fetch head root + finality from the Beacon API this often.
+const BEACON_CHECKPOINT_REFRESH: Duration = Duration::from_secs(180);
+
 async fn refresh_status(
     bootstrap: BeaconBootstrap,
     spec: Arc<ChainSpec>,
+    genesis_time: u64,
+    mut checkpoints: bootstrap::StatusCheckpoints,
     status: watch::Sender<StatusMessage>,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(6));
+    let mut interval = tokio::time::interval(STATUS_TICK);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Startup already fetched checkpoints; wait a full period before the next
+    // paid Beacon API round-trip.
+    let mut next_beacon_refresh = Instant::now() + BEACON_CHECKPOINT_REFRESH;
+
     loop {
         interval.tick().await;
-        match bootstrap.status(&spec).await {
-            Ok(next) => {
-                status.send_replace(next);
+        let Ok(head_slot) = current_slot(genesis_time, &spec) else {
+            warn!("system clock predates genesis; skipping status tick");
+            continue;
+        };
+        if Instant::now() >= next_beacon_refresh {
+            match bootstrap.fetch_checkpoints().await {
+                Ok(next) => {
+                    checkpoints = next;
+                    next_beacon_refresh = Instant::now() + BEACON_CHECKPOINT_REFRESH;
+                }
+                Err(error) => {
+                    warn!(%error, "failed to refresh beacon status checkpoints");
+                    // Back off briefly so a flapping provider does not spin.
+                    next_beacon_refresh = Instant::now() + Duration::from_secs(30);
+                }
             }
-            Err(error) => warn!(%error, "failed to refresh beacon status"),
         }
+        status.send_replace(bootstrap.build_status(&spec, head_slot, &checkpoints));
     }
 }
 
